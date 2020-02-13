@@ -6,6 +6,8 @@
 package migrations
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,7 +23,10 @@ import (
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/migrations/base"
+	"code.gitea.io/gitea/modules/repository"
+	repo_module "code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/timeutil"
 
 	gouuid "github.com/satori/go.uuid"
@@ -33,24 +38,31 @@ var (
 
 // GiteaLocalUploader implements an Uploader to gitea sites
 type GiteaLocalUploader struct {
-	doer        *models.User
-	repoOwner   string
-	repoName    string
-	repo        *models.Repository
-	labels      sync.Map
-	milestones  sync.Map
-	issues      sync.Map
-	gitRepo     *git.Repository
-	prHeadCache map[string]struct{}
+	ctx            context.Context
+	doer           *models.User
+	repoOwner      string
+	repoName       string
+	repo           *models.Repository
+	labels         sync.Map
+	milestones     sync.Map
+	issues         sync.Map
+	gitRepo        *git.Repository
+	prHeadCache    map[string]struct{}
+	userMap        map[int64]int64 // external user id mapping to user id
+	prCache        map[int64]*models.PullRequest
+	gitServiceType structs.GitServiceType
 }
 
 // NewGiteaLocalUploader creates an gitea Uploader via gitea API v1
-func NewGiteaLocalUploader(doer *models.User, repoOwner, repoName string) *GiteaLocalUploader {
+func NewGiteaLocalUploader(ctx context.Context, doer *models.User, repoOwner, repoName string) *GiteaLocalUploader {
 	return &GiteaLocalUploader{
+		ctx:         ctx,
 		doer:        doer,
 		repoOwner:   repoOwner,
 		repoName:    repoName,
 		prHeadCache: make(map[string]struct{}),
+		userMap:     make(map[int64]int64),
+		prCache:     make(map[int64]*models.PullRequest),
 	}
 }
 
@@ -90,22 +102,49 @@ func (g *GiteaLocalUploader) CreateRepo(repo *base.Repository, opts base.Migrate
 		remoteAddr = u.String()
 	}
 
-	r, err := models.MigrateRepository(g.doer, owner, models.MigrateRepoOptions{
-		Name:                 g.repoName,
-		Description:          repo.Description,
-		OriginalURL:          repo.OriginalURL,
-		IsMirror:             repo.IsMirror,
-		RemoteAddr:           remoteAddr,
-		IsPrivate:            repo.IsPrivate,
-		Wiki:                 opts.Wiki,
-		SyncReleasesWithTags: !opts.Releases, // if didn't get releases, then sync them from tags
+	var r *models.Repository
+	if opts.MigrateToRepoID <= 0 {
+		r, err = repo_module.CreateRepository(g.doer, owner, models.CreateRepoOptions{
+			Name:           g.repoName,
+			Description:    repo.Description,
+			OriginalURL:    repo.OriginalURL,
+			GitServiceType: opts.GitServiceType,
+			IsPrivate:      opts.Private,
+			IsMirror:       opts.Mirror,
+			Status:         models.RepositoryBeingMigrated,
+		})
+	} else {
+		r, err = models.GetRepositoryByID(opts.MigrateToRepoID)
+	}
+	if err != nil {
+		return err
+	}
+
+	r, err = repository.MigrateRepositoryGitData(g.doer, owner, r, structs.MigrateRepoOption{
+		RepoName:       g.repoName,
+		Description:    repo.Description,
+		OriginalURL:    repo.OriginalURL,
+		GitServiceType: opts.GitServiceType,
+		Mirror:         repo.IsMirror,
+		CloneAddr:      remoteAddr,
+		Private:        repo.IsPrivate,
+		Wiki:           opts.Wiki,
+		Releases:       opts.Releases, // if didn't get releases, then sync them from tags
 	})
+
 	g.repo = r
 	if err != nil {
 		return err
 	}
 	g.gitRepo, err = git.OpenRepository(r.RepoPath())
 	return err
+}
+
+// Close closes this uploader
+func (g *GiteaLocalUploader) Close() {
+	if g.gitRepo != nil {
+		g.gitRepo.Close()
+	}
 }
 
 // CreateTopics creates topics
@@ -176,7 +215,6 @@ func (g *GiteaLocalUploader) CreateReleases(releases ...*base.Release) error {
 	for _, release := range releases {
 		var rel = models.Release{
 			RepoID:       g.repo.ID,
-			PublisherID:  g.doer.ID,
 			TagName:      release.TagName,
 			LowerTagName: strings.ToLower(release.TagName),
 			Target:       release.TargetCommitish,
@@ -187,6 +225,27 @@ func (g *GiteaLocalUploader) CreateReleases(releases ...*base.Release) error {
 			IsPrerelease: release.Prerelease,
 			IsTag:        false,
 			CreatedUnix:  timeutil.TimeStamp(release.Created.Unix()),
+		}
+
+		userid, ok := g.userMap[release.PublisherID]
+		tp := g.gitServiceType.Name()
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", release.PublisherID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[release.PublisherID] = userid
+			}
+		}
+
+		if userid > 0 {
+			rel.PublisherID = userid
+		} else {
+			rel.PublisherID = g.doer.ID
+			rel.OriginalAuthor = release.PublisherName
+			rel.OriginalAuthorID = release.PublisherID
 		}
 
 		// calc NumCommits
@@ -209,38 +268,42 @@ func (g *GiteaLocalUploader) CreateReleases(releases ...*base.Release) error {
 			}
 
 			// download attachment
-			resp, err := http.Get(asset.URL)
+			err = func() error {
+				resp, err := http.Get(asset.URL)
+				if err != nil {
+					return err
+				}
+				defer resp.Body.Close()
+
+				localPath := attach.LocalPath()
+				if err = os.MkdirAll(path.Dir(localPath), os.ModePerm); err != nil {
+					return fmt.Errorf("MkdirAll: %v", err)
+				}
+
+				fw, err := os.Create(localPath)
+				if err != nil {
+					return fmt.Errorf("Create: %v", err)
+				}
+				defer fw.Close()
+
+				_, err = io.Copy(fw, resp.Body)
+				return err
+			}()
 			if err != nil {
 				return err
 			}
-			defer resp.Body.Close()
-
-			localPath := attach.LocalPath()
-			if err = os.MkdirAll(path.Dir(localPath), os.ModePerm); err != nil {
-				return fmt.Errorf("MkdirAll: %v", err)
-			}
-
-			fw, err := os.Create(localPath)
-			if err != nil {
-				return fmt.Errorf("Create: %v", err)
-			}
-			defer fw.Close()
-
-			if _, err := io.Copy(fw, resp.Body); err != nil {
-				return err
-			}
-
 			rel.Attachments = append(rel.Attachments, &attach)
 		}
 
 		rels = append(rels, &rel)
 	}
-	if err := models.InsertReleases(rels...); err != nil {
-		return err
-	}
 
-	// sync tags to releases in database
-	return models.SyncReleasesWithTags(g.repo, g.gitRepo)
+	return models.InsertReleases(rels...)
+}
+
+// SyncTags syncs releases with tags in the database
+func (g *GiteaLocalUploader) SyncTags() error {
+	return repository.SyncReleasesWithTags(g.repo, g.gitRepo)
 }
 
 // CreateIssues creates issues
@@ -264,24 +327,69 @@ func (g *GiteaLocalUploader) CreateIssues(issues ...*base.Issue) error {
 		}
 
 		var is = models.Issue{
-			RepoID:           g.repo.ID,
-			Repo:             g.repo,
-			Index:            issue.Number,
-			PosterID:         g.doer.ID,
-			OriginalAuthor:   issue.PosterName,
-			OriginalAuthorID: issue.PosterID,
-			Title:            issue.Title,
-			Content:          issue.Content,
-			IsClosed:         issue.State == "closed",
-			IsLocked:         issue.IsLocked,
-			MilestoneID:      milestoneID,
-			Labels:           labels,
-			CreatedUnix:      timeutil.TimeStamp(issue.Created.Unix()),
+			RepoID:      g.repo.ID,
+			Repo:        g.repo,
+			Index:       issue.Number,
+			Title:       issue.Title,
+			Content:     issue.Content,
+			IsClosed:    issue.State == "closed",
+			IsLocked:    issue.IsLocked,
+			MilestoneID: milestoneID,
+			Labels:      labels,
+			CreatedUnix: timeutil.TimeStamp(issue.Created.Unix()),
+			UpdatedUnix: timeutil.TimeStamp(issue.Updated.Unix()),
 		}
+
+		userid, ok := g.userMap[issue.PosterID]
+		tp := g.gitServiceType.Name()
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", issue.PosterID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[issue.PosterID] = userid
+			}
+		}
+
+		if userid > 0 {
+			is.PosterID = userid
+		} else {
+			is.PosterID = g.doer.ID
+			is.OriginalAuthor = issue.PosterName
+			is.OriginalAuthorID = issue.PosterID
+		}
+
 		if issue.Closed != nil {
 			is.ClosedUnix = timeutil.TimeStamp(issue.Closed.Unix())
 		}
-		// TODO: add reactions
+		// add reactions
+		for _, reaction := range issue.Reactions {
+			userid, ok := g.userMap[reaction.UserID]
+			if !ok && tp != "" {
+				var err error
+				userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", reaction.UserID))
+				if err != nil {
+					log.Error("GetUserIDByExternalUserID: %v", err)
+				}
+				if userid > 0 {
+					g.userMap[reaction.UserID] = userid
+				}
+			}
+			var res = models.Reaction{
+				Type:        reaction.Content,
+				CreatedUnix: timeutil.TimeStampNow(),
+			}
+			if userid > 0 {
+				res.UserID = userid
+			} else {
+				res.UserID = g.doer.ID
+				res.OriginalAuthorID = reaction.UserID
+				res.OriginalAuthor = reaction.UserName
+			}
+			is.Reactions = append(is.Reactions, &res)
+		}
 		iss = append(iss, &is)
 	}
 
@@ -311,17 +419,63 @@ func (g *GiteaLocalUploader) CreateComments(comments ...*base.Comment) error {
 			issueID = issueIDStr.(int64)
 		}
 
-		cms = append(cms, &models.Comment{
-			IssueID:          issueID,
-			Type:             models.CommentTypeComment,
-			PosterID:         g.doer.ID,
-			OriginalAuthor:   comment.PosterName,
-			OriginalAuthorID: comment.PosterID,
-			Content:          comment.Content,
-			CreatedUnix:      timeutil.TimeStamp(comment.Created.Unix()),
-		})
+		userid, ok := g.userMap[comment.PosterID]
+		tp := g.gitServiceType.Name()
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", comment.PosterID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[comment.PosterID] = userid
+			}
+		}
 
-		// TODO: Reactions
+		cm := models.Comment{
+			IssueID:     issueID,
+			Type:        models.CommentTypeComment,
+			Content:     comment.Content,
+			CreatedUnix: timeutil.TimeStamp(comment.Created.Unix()),
+			UpdatedUnix: timeutil.TimeStamp(comment.Updated.Unix()),
+		}
+
+		if userid > 0 {
+			cm.PosterID = userid
+		} else {
+			cm.PosterID = g.doer.ID
+			cm.OriginalAuthor = comment.PosterName
+			cm.OriginalAuthorID = comment.PosterID
+		}
+
+		// add reactions
+		for _, reaction := range comment.Reactions {
+			userid, ok := g.userMap[reaction.UserID]
+			if !ok && tp != "" {
+				var err error
+				userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", reaction.UserID))
+				if err != nil {
+					log.Error("GetUserIDByExternalUserID: %v", err)
+				}
+				if userid > 0 {
+					g.userMap[reaction.UserID] = userid
+				}
+			}
+			var res = models.Reaction{
+				Type:        reaction.Content,
+				CreatedUnix: timeutil.TimeStampNow(),
+			}
+			if userid > 0 {
+				res.UserID = userid
+			} else {
+				res.UserID = g.doer.ID
+				res.OriginalAuthorID = reaction.UserID
+				res.OriginalAuthor = reaction.UserName
+			}
+			cm.Reactions = append(cm.Reactions, &res)
+		}
+
+		cms = append(cms, &cm)
 	}
 
 	return models.InsertIssueComments(cms)
@@ -335,6 +489,28 @@ func (g *GiteaLocalUploader) CreatePullRequests(prs ...*base.PullRequest) error 
 		if err != nil {
 			return err
 		}
+
+		userid, ok := g.userMap[pr.PosterID]
+		tp := g.gitServiceType.Name()
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", pr.PosterID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[pr.PosterID] = userid
+			}
+		}
+
+		if userid > 0 {
+			gpr.Issue.PosterID = userid
+		} else {
+			gpr.Issue.PosterID = g.doer.ID
+			gpr.Issue.OriginalAuthor = pr.PosterName
+			gpr.Issue.OriginalAuthorID = pr.PosterID
+		}
+
 		gprs = append(gprs, gpr)
 	}
 	if err := models.InsertPullRequests(gprs...); err != nil {
@@ -364,21 +540,24 @@ func (g *GiteaLocalUploader) newPullRequest(pr *base.PullRequest) (*models.PullR
 	}
 
 	// download patch file
-	resp, err := http.Get(pr.PatchURL)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	pullDir := filepath.Join(g.repo.RepoPath(), "pulls")
-	if err = os.MkdirAll(pullDir, os.ModePerm); err != nil {
-		return nil, err
-	}
-	f, err := os.Create(filepath.Join(pullDir, fmt.Sprintf("%d.patch", pr.Number)))
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
+	err := func() error {
+		resp, err := http.Get(pr.PatchURL)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		pullDir := filepath.Join(g.repo.RepoPath(), "pulls")
+		if err = os.MkdirAll(pullDir, os.ModePerm); err != nil {
+			return err
+		}
+		f, err := os.Create(filepath.Join(pullDir, fmt.Sprintf("%d.patch", pr.Number)))
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(f, resp.Body)
+		return err
+	}()
 	if err != nil {
 		return nil, err
 	}
@@ -392,8 +571,8 @@ func (g *GiteaLocalUploader) newPullRequest(pr *base.PullRequest) (*models.PullR
 	if err != nil {
 		return nil, err
 	}
-	defer p.Close()
 	_, err = p.WriteString(pr.Head.SHA)
+	p.Close()
 	if err != nil {
 		return nil, err
 	}
@@ -427,8 +606,8 @@ func (g *GiteaLocalUploader) newPullRequest(pr *base.PullRequest) (*models.PullR
 					if err != nil {
 						return nil, err
 					}
-					defer b.Close()
 					_, err = b.WriteString(pr.Head.SHA)
+					b.Close()
 					if err != nil {
 						return nil, err
 					}
@@ -440,32 +619,80 @@ func (g *GiteaLocalUploader) newPullRequest(pr *base.PullRequest) (*models.PullR
 		head = pr.Head.Ref
 	}
 
-	var pullRequest = models.PullRequest{
-		HeadRepoID:   g.repo.ID,
-		HeadBranch:   head,
-		HeadUserName: g.repoOwner,
-		BaseRepoID:   g.repo.ID,
-		BaseBranch:   pr.Base.Ref,
-		MergeBase:    pr.Base.SHA,
-		Index:        pr.Number,
-		HasMerged:    pr.Merged,
+	var issue = models.Issue{
+		RepoID:      g.repo.ID,
+		Repo:        g.repo,
+		Title:       pr.Title,
+		Index:       pr.Number,
+		Content:     pr.Content,
+		MilestoneID: milestoneID,
+		IsPull:      true,
+		IsClosed:    pr.State == "closed",
+		IsLocked:    pr.IsLocked,
+		Labels:      labels,
+		CreatedUnix: timeutil.TimeStamp(pr.Created.Unix()),
+		UpdatedUnix: timeutil.TimeStamp(pr.Updated.Unix()),
+	}
 
-		Issue: &models.Issue{
-			RepoID:           g.repo.ID,
-			Repo:             g.repo,
-			Title:            pr.Title,
-			Index:            pr.Number,
-			PosterID:         g.doer.ID,
-			OriginalAuthor:   pr.PosterName,
-			OriginalAuthorID: pr.PosterID,
-			Content:          pr.Content,
-			MilestoneID:      milestoneID,
-			IsPull:           true,
-			IsClosed:         pr.State == "closed",
-			IsLocked:         pr.IsLocked,
-			Labels:           labels,
-			CreatedUnix:      timeutil.TimeStamp(pr.Created.Unix()),
-		},
+	tp := g.gitServiceType.Name()
+
+	userid, ok := g.userMap[pr.PosterID]
+	if !ok && tp != "" {
+		var err error
+		userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", pr.PosterID))
+		if err != nil {
+			log.Error("GetUserIDByExternalUserID: %v", err)
+		}
+		if userid > 0 {
+			g.userMap[pr.PosterID] = userid
+		}
+	}
+
+	if userid > 0 {
+		issue.PosterID = userid
+	} else {
+		issue.PosterID = g.doer.ID
+		issue.OriginalAuthor = pr.PosterName
+		issue.OriginalAuthorID = pr.PosterID
+	}
+
+	// add reactions
+	for _, reaction := range pr.Reactions {
+		userid, ok := g.userMap[reaction.UserID]
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", reaction.UserID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[reaction.UserID] = userid
+			}
+		}
+		var res = models.Reaction{
+			Type:        reaction.Content,
+			CreatedUnix: timeutil.TimeStampNow(),
+		}
+		if userid > 0 {
+			res.UserID = userid
+		} else {
+			res.UserID = g.doer.ID
+			res.OriginalAuthorID = reaction.UserID
+			res.OriginalAuthor = reaction.UserName
+		}
+		issue.Reactions = append(issue.Reactions, &res)
+	}
+
+	var pullRequest = models.PullRequest{
+		HeadRepoID: g.repo.ID,
+		HeadBranch: head,
+		BaseRepoID: g.repo.ID,
+		BaseBranch: pr.Base.Ref,
+		MergeBase:  pr.Base.SHA,
+		Index:      pr.Number,
+		HasMerged:  pr.Merged,
+
+		Issue: &issue,
 	}
 
 	if pullRequest.Issue.IsClosed && pr.Closed != nil {
@@ -477,10 +704,128 @@ func (g *GiteaLocalUploader) newPullRequest(pr *base.PullRequest) (*models.PullR
 		pullRequest.MergerID = g.doer.ID
 	}
 
-	// TODO: reactions
 	// TODO: assignees
 
 	return &pullRequest, nil
+}
+
+func convertReviewState(state string) models.ReviewType {
+	switch state {
+	case base.ReviewStatePending:
+		return models.ReviewTypePending
+	case base.ReviewStateApproved:
+		return models.ReviewTypeApprove
+	case base.ReviewStateChangesRequested:
+		return models.ReviewTypeReject
+	case base.ReviewStateCommented:
+		return models.ReviewTypeComment
+	default:
+		return models.ReviewTypePending
+	}
+}
+
+// CreateReviews create pull request reviews
+func (g *GiteaLocalUploader) CreateReviews(reviews ...*base.Review) error {
+	var cms = make([]*models.Review, 0, len(reviews))
+	for _, review := range reviews {
+		var issueID int64
+		if issueIDStr, ok := g.issues.Load(review.IssueIndex); !ok {
+			issue, err := models.GetIssueByIndex(g.repo.ID, review.IssueIndex)
+			if err != nil {
+				return err
+			}
+			issueID = issue.ID
+			g.issues.Store(review.IssueIndex, issueID)
+		} else {
+			issueID = issueIDStr.(int64)
+		}
+
+		userid, ok := g.userMap[review.ReviewerID]
+		tp := g.gitServiceType.Name()
+		if !ok && tp != "" {
+			var err error
+			userid, err = models.GetUserIDByExternalUserID(tp, fmt.Sprintf("%v", review.ReviewerID))
+			if err != nil {
+				log.Error("GetUserIDByExternalUserID: %v", err)
+			}
+			if userid > 0 {
+				g.userMap[review.ReviewerID] = userid
+			}
+		}
+
+		var cm = models.Review{
+			Type:        convertReviewState(review.State),
+			IssueID:     issueID,
+			Content:     review.Content,
+			Official:    review.Official,
+			CreatedUnix: timeutil.TimeStamp(review.CreatedAt.Unix()),
+			UpdatedUnix: timeutil.TimeStamp(review.CreatedAt.Unix()),
+		}
+
+		if userid > 0 {
+			cm.ReviewerID = userid
+		} else {
+			cm.ReviewerID = g.doer.ID
+			cm.OriginalAuthor = review.ReviewerName
+			cm.OriginalAuthorID = review.ReviewerID
+		}
+
+		// get pr
+		pr, ok := g.prCache[issueID]
+		if !ok {
+			var err error
+			pr, err = models.GetPullRequestByIssueIDWithNoAttributes(issueID)
+			if err != nil {
+				return err
+			}
+			g.prCache[issueID] = pr
+		}
+
+		for _, comment := range review.Comments {
+			_, _, line, _ := git.ParseDiffHunkString(comment.DiffHunk)
+
+			headCommitID, err := g.gitRepo.GetRefCommitID(pr.GetGitRefName())
+			if err != nil {
+				return fmt.Errorf("GetRefCommitID[%s]: %v", pr.GetGitRefName(), err)
+			}
+
+			var patch string
+			patchBuf := new(bytes.Buffer)
+			if err := git.GetRepoRawDiffForFile(g.gitRepo, pr.MergeBase, headCommitID, git.RawDiffNormal, comment.TreePath, patchBuf); err != nil {
+				// We should ignore the error since the commit maybe removed when force push to the pull request
+				log.Warn("GetRepoRawDiffForFile failed when migrating [%s, %s, %s, %s]: %v", g.gitRepo.Path, pr.MergeBase, headCommitID, comment.TreePath, err)
+			} else {
+				patch = git.CutDiffAroundLine(patchBuf, int64((&models.Comment{Line: int64(line + comment.Position - 1)}).UnsignedLine()), line < 0, setting.UI.CodeCommentLines)
+			}
+
+			var c = models.Comment{
+				Type:        models.CommentTypeCode,
+				PosterID:    comment.PosterID,
+				IssueID:     issueID,
+				Content:     comment.Content,
+				Line:        int64(line + comment.Position - 1),
+				TreePath:    comment.TreePath,
+				CommitSHA:   comment.CommitID,
+				Patch:       patch,
+				CreatedUnix: timeutil.TimeStamp(comment.CreatedAt.Unix()),
+				UpdatedUnix: timeutil.TimeStamp(comment.UpdatedAt.Unix()),
+			}
+
+			if userid > 0 {
+				c.PosterID = userid
+			} else {
+				c.PosterID = g.doer.ID
+				c.OriginalAuthor = review.ReviewerName
+				c.OriginalAuthorID = review.ReviewerID
+			}
+
+			cm.Comments = append(cm.Comments, &c)
+		}
+
+		cms = append(cms, &cm)
+	}
+
+	return models.InsertReviews(cms)
 }
 
 // Rollback when migrating failed, this will rollback all the changes.

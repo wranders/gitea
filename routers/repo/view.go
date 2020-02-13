@@ -11,11 +11,13 @@ import (
 	"fmt"
 	gotemplate "html/template"
 	"io/ioutil"
+	"net/url"
 	"path"
 	"strings"
 
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/base"
+	"code.gitea.io/gitea/modules/cache"
 	"code.gitea.io/gitea/modules/charset"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/git"
@@ -31,6 +33,7 @@ const (
 	tplRepoHome  base.TplName = "repo/home"
 	tplWatchers  base.TplName = "repo/watchers"
 	tplForks     base.TplName = "repo/forks"
+	tplMigrating base.TplName = "repo/migrating"
 )
 
 func renderDirectory(ctx *context.Context, treeLink string) {
@@ -47,8 +50,13 @@ func renderDirectory(ctx *context.Context, treeLink string) {
 	}
 	entries.CustomSort(base.NaturalSortLess)
 
+	var c git.LastCommitCache
+	if setting.CacheService.LastCommit.Enabled && ctx.Repo.CommitsCount >= setting.CacheService.LastCommit.CommitsCount {
+		c = cache.NewLastCommitCache(ctx.Repo.Repository.FullName(), ctx.Repo.GitRepo, int64(setting.CacheService.LastCommit.TTL.Seconds()))
+	}
+
 	var latestCommit *git.Commit
-	ctx.Data["Files"], latestCommit, err = entries.GetCommitsInfo(ctx.Repo.Commit, ctx.Repo.TreePath, nil)
+	ctx.Data["Files"], latestCommit, err = entries.GetCommitsInfo(ctx.Repo.Commit, ctx.Repo.TreePath, c)
 	if err != nil {
 		ctx.ServerError("GetCommitsInfo", err)
 		return
@@ -263,6 +271,17 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry, treeLink, rawLink st
 			ctx.Data["RawFileLink"] = fmt.Sprintf("%s%s.git/info/lfs/objects/%s/%s", setting.AppURL, ctx.Repo.Repository.FullName(), meta.Oid, filenameBase64)
 		}
 	}
+	// Check LFS Lock
+	lfsLock, err := ctx.Repo.Repository.GetTreePathLock(ctx.Repo.TreePath)
+	ctx.Data["LFSLock"] = lfsLock
+	if err != nil {
+		ctx.ServerError("GetTreePathLock", err)
+		return
+	}
+	if lfsLock != nil {
+		ctx.Data["LFSLockOwner"] = lfsLock.Owner.DisplayName()
+		ctx.Data["LFSLockHint"] = ctx.Tr("repo.editor.this_file_locked")
+	}
 
 	// Assume file is not editable first.
 	if isLFSFile {
@@ -304,6 +323,13 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry, treeLink, rawLink st
 
 			var output bytes.Buffer
 			lines := strings.Split(fileContent, "\n")
+			ctx.Data["NumLines"] = len(lines)
+			if len(lines) == 1 && lines[0] == "" {
+				// If the file is completely empty, we show zero lines at the line counter
+				ctx.Data["NumLines"] = 0
+			}
+			ctx.Data["NumLinesSet"] = true
+
 			//Remove blank line at the end of file
 			if len(lines) > 0 && lines[len(lines)-1] == "" {
 				lines = lines[:len(lines)-1]
@@ -325,8 +351,13 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry, treeLink, rawLink st
 		}
 		if !isLFSFile {
 			if ctx.Repo.CanEnableEditor() {
-				ctx.Data["CanEditFile"] = true
-				ctx.Data["EditFileTooltip"] = ctx.Tr("repo.editor.edit_this_file")
+				if lfsLock != nil && lfsLock.OwnerID != ctx.User.ID {
+					ctx.Data["CanEditFile"] = false
+					ctx.Data["EditFileTooltip"] = ctx.Tr("repo.editor.this_file_locked")
+				} else {
+					ctx.Data["CanEditFile"] = true
+					ctx.Data["EditFileTooltip"] = ctx.Tr("repo.editor.edit_this_file")
+				}
 			} else if !ctx.Repo.IsViewBranch {
 				ctx.Data["EditFileTooltip"] = ctx.Tr("repo.editor.must_be_on_a_branch")
 			} else if !ctx.Repo.CanWrite(models.UnitTypeCode) {
@@ -342,11 +373,30 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry, treeLink, rawLink st
 		ctx.Data["IsAudioFile"] = true
 	case base.IsImageFile(buf):
 		ctx.Data["IsImageFile"] = true
+	default:
+		if fileSize >= setting.UI.MaxDisplayFileSize {
+			ctx.Data["IsFileTooLarge"] = true
+			break
+		}
+
+		if markupType := markup.Type(blob.Name()); markupType != "" {
+			d, _ := ioutil.ReadAll(dataRc)
+			buf = append(buf, d...)
+			ctx.Data["IsMarkup"] = true
+			ctx.Data["MarkupType"] = markupType
+			ctx.Data["FileContent"] = string(markup.Render(blob.Name(), buf, path.Dir(treeLink), ctx.Repo.Repository.ComposeMetas()))
+		}
+
 	}
 
 	if ctx.Repo.CanEnableEditor() {
-		ctx.Data["CanDeleteFile"] = true
-		ctx.Data["DeleteFileTooltip"] = ctx.Tr("repo.editor.delete_this_file")
+		if lfsLock != nil && lfsLock.OwnerID != ctx.User.ID {
+			ctx.Data["CanDeleteFile"] = false
+			ctx.Data["DeleteFileTooltip"] = ctx.Tr("repo.editor.this_file_locked")
+		} else {
+			ctx.Data["CanDeleteFile"] = true
+			ctx.Data["DeleteFileTooltip"] = ctx.Tr("repo.editor.delete_this_file")
+		}
 	} else if !ctx.Repo.IsViewBranch {
 		ctx.Data["DeleteFileTooltip"] = ctx.Tr("repo.editor.must_be_on_a_branch")
 	} else if !ctx.Repo.CanWrite(models.UnitTypeCode) {
@@ -354,9 +404,37 @@ func renderFile(ctx *context.Context, entry *git.TreeEntry, treeLink, rawLink st
 	}
 }
 
+func safeURL(address string) string {
+	u, err := url.Parse(address)
+	if err != nil {
+		return address
+	}
+	u.User = nil
+	return u.String()
+}
+
 // Home render repository home page
 func Home(ctx *context.Context) {
 	if len(ctx.Repo.Units) > 0 {
+		if ctx.Repo.Repository.IsBeingCreated() {
+			task, err := models.GetMigratingTask(ctx.Repo.Repository.ID)
+			if err != nil {
+				ctx.ServerError("models.GetMigratingTask", err)
+				return
+			}
+			cfg, err := task.MigrateConfig()
+			if err != nil {
+				ctx.ServerError("task.MigrateConfig", err)
+				return
+			}
+
+			ctx.Data["Repo"] = ctx.Repo
+			ctx.Data["MigrateTask"] = task
+			ctx.Data["CloneAddr"] = safeURL(cfg.CloneAddr)
+			ctx.HTML(200, tplMigrating)
+			return
+		}
+
 		var firstUnit *models.Unit
 		for _, repoUnit := range ctx.Repo.Units {
 			if repoUnit.Type == models.UnitTypeCode {
@@ -377,6 +455,16 @@ func Home(ctx *context.Context) {
 	}
 
 	ctx.NotFound("Home", fmt.Errorf(ctx.Tr("units.error.no_unit_allowed_repo")))
+}
+
+func renderLanguageStats(ctx *context.Context) {
+	langs, err := ctx.Repo.Repository.GetTopLanguageStats(5)
+	if err != nil {
+		ctx.ServerError("Repo.GetTopLanguageStats", err)
+		return
+	}
+
+	ctx.Data["LanguageStats"] = langs
 }
 
 func renderCode(ctx *context.Context) {
@@ -419,6 +507,11 @@ func renderCode(ctx *context.Context) {
 		return
 	}
 
+	renderLanguageStats(ctx)
+	if ctx.Written() {
+		return
+	}
+
 	if entry.IsDir() {
 		renderDirectory(ctx, treeLink)
 	} else {
@@ -450,7 +543,7 @@ func renderCode(ctx *context.Context) {
 }
 
 // RenderUserCards render a page show users according the input templaet
-func RenderUserCards(ctx *context.Context, total int, getter func(page int) ([]*models.User, error), tpl base.TplName) {
+func RenderUserCards(ctx *context.Context, total int, getter func(opts models.ListOptions) ([]*models.User, error), tpl base.TplName) {
 	page := ctx.QueryInt("page")
 	if page <= 0 {
 		page = 1
@@ -458,7 +551,7 @@ func RenderUserCards(ctx *context.Context, total int, getter func(page int) ([]*
 	pager := context.NewPagination(total, models.ItemsPerPage, page, 5)
 	ctx.Data["Page"] = pager
 
-	items, err := getter(pager.Paginater.Current())
+	items, err := getter(models.ListOptions{Page: pager.Paginater.Current()})
 	if err != nil {
 		ctx.ServerError("getter", err)
 		return
@@ -489,7 +582,7 @@ func Stars(ctx *context.Context) {
 func Forks(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("repos.forks")
 
-	forks, err := ctx.Repo.Repository.GetForks()
+	forks, err := ctx.Repo.Repository.GetForks(models.ListOptions{})
 	if err != nil {
 		ctx.ServerError("GetForks", err)
 		return

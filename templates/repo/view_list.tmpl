@@ -1,4 +1,4 @@
-<table id="repo-files-table" class="ui single line table fixed">
+<table id="repo-files-table" class="ui single line table">
 	<thead>
 		<tr class="commit-list">
 			<th colspan="2">
@@ -42,7 +42,7 @@
 	<tbody>
 		{{if .HasParentPath}}
 			<tr class="has-parent">
-				<td colspan="3"><i class="octicon octicon-mail-reply"></i><a href="{{EscapePound .BranchLink}}{{.ParentPath}}">..</a></td>
+				<td colspan="3">{{svg "octicon-mail-reply" 16}}<a href="{{EscapePound .BranchLink}}{{.ParentPath}}">..</a></td>
 			</tr>
 		{{end}}
 		{{range $item := .Files}}
@@ -52,7 +52,7 @@
 				{{if $entry.IsSubModule}}
 					<td>
 						<span class="truncate">
-							<span class="octicon octicon-file-submodule"></span>
+							{{svg "octicon-file-submodule" 16}}
 							{{$refURL := $commit.RefURL AppUrl $.BranchLink}}
 							{{if $refURL}}
 								<a href="{{$refURL}}">{{$entry.Name}}</a> @ <a href="{{$refURL}}/commit/{{$commit.RefID}}">{{ShortSha $commit.RefID}}</a>
@@ -62,12 +62,12 @@
 						</span>
 					</td>
 				{{else}}
-					<td class="name">
+					<td class="name four wide">
 						<span class="truncate">
 							{{if $entry.IsDir}}
 								{{$subJumpablePathName := $entry.GetSubJumpablePathName}}
 								{{$subJumpablePath := SubJumpablePath $subJumpablePathName}}
-								<span class="octicon octicon-file-directory"></span>
+								{{svg "octicon-file-directory" 16}}
 								<a href="{{EscapePound $.TreeLink}}/{{EscapePound $subJumpablePathName}}" title="{{$subJumpablePathName}}">
 									{{if eq (len $subJumpablePath) 2}}
 										<span class="jumpable-path">{{index  $subJumpablePath 0}}</span>{{index  $subJumpablePath 1}}
@@ -76,18 +76,18 @@
 									{{end}}
 								</a>
 							{{else}}
-								<span class="octicon octicon-{{EntryIcon $entry}}"></span>
+								{{svg (printf "octicon-%s" (EntryIcon $entry)) 16}}
 								<a href="{{EscapePound $.TreeLink}}/{{EscapePound $entry.Name}}" title="{{$entry.Name}}">{{$entry.Name}}</a>
 							{{end}}
 						</span>
 					</td>
 				{{end}}
-				<td class="message">
+				<td class="message nine wide">
 					<span class="truncate has-emoji">
 						<a href="{{$.RepoLink}}/commit/{{$commit.ID}}" title="{{$commit.Summary}}">{{$commit.Summary}}</a>
 					</span>
 				</td>
-				<td class="text grey right age">{{TimeSince $commit.Committer.When $.Lang}}</td>
+				<td class="text right age three wide">{{TimeSince $commit.Committer.When $.Lang}}</td>
 			</tr>
 		{{end}}
 	</tbody>

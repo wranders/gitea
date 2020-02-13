@@ -13,7 +13,7 @@
 			{{ end }}
 		</h2>
 		<div class="ui segment choose branch">
-			<span class="octicon octicon-git-compare"></span>
+			{{svg "octicon-git-compare" 16}}
 			<div class="ui floating filter dropdown" data-no-results="{{.i18n.Tr "repo.pulls.no_results"}}">
 				<div class="ui basic small button">
 					<span class="text">{{.i18n.Tr "repo.pulls.compare_base"}}: {{$.BaseName}}:{{$.BaseBranch}}</span>
@@ -27,6 +27,11 @@
 					<div class="scrolling menu">
 						{{range .Branches}}
 							<div class="item {{if eq $.BaseBranch .}}selected{{end}}" data-url="{{$.RepoLink}}/compare/{{EscapePound .}}...{{if not $.PullRequestCtx.SameRepo}}{{$.HeadUser.Name}}:{{end}}{{EscapePound $.HeadBranch}}">{{$.BaseName}}:{{.}}</div>
+						{{end}}
+						{{if .Repository.IsFork}}
+							{{range .BaseRepoBranches}}
+							<div class="item" data-url="{{$.PullRequestCtx.BaseRepo.Link}}/compare/{{EscapePound .}}...{{$.HeadUser.Name}}:{{EscapePound $.HeadBranch}}">{{$.PullRequestCtx.BaseRepo.OwnerName}}:{{.}}</div>
+							{{end}}
 						{{end}}
 					</div>
 				</div>
@@ -54,7 +59,7 @@
 
 	{{if .IsNothingToCompare}}
     	<div class="ui segment">{{.i18n.Tr "repo.pulls.nothing_to_compare"}}</div>
-    {{else if .PageIsComparePull}}
+	{{else if .PageIsComparePull}}
 		{{if .HasPullRequest}}
         	<div class="ui segment">
         		{{.i18n.Tr "repo.pulls.has_pull_request" $.RepoLink $.RepoRelPath .PullRequest.Index | Safe}}

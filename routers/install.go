@@ -16,13 +16,14 @@ import (
 	"code.gitea.io/gitea/modules/base"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/generate"
+	"code.gitea.io/gitea/modules/graceful"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/user"
 
-	"github.com/go-xorm/xorm"
 	"github.com/unknwon/com"
 	"gopkg.in/ini.v1"
+	"xorm.io/xorm"
 )
 
 const (
@@ -53,6 +54,7 @@ func Install(ctx *context.Context) {
 	form.DbPasswd = setting.Database.Passwd
 	form.DbName = setting.Database.Name
 	form.DbPath = setting.Database.Path
+	form.DbSchema = setting.Database.Schema
 	form.Charset = setting.Database.Charset
 
 	ctx.Data["CurDbOption"] = "MySQL"
@@ -146,6 +148,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	setting.Database.User = form.DbUser
 	setting.Database.Passwd = form.DbPasswd
 	setting.Database.Name = form.DbName
+	setting.Database.Schema = form.DbSchema
 	setting.Database.SSLMode = form.SSLMode
 	setting.Database.Charset = form.Charset
 	setting.Database.Path = form.DbPath
@@ -266,6 +269,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	cfg.Section("database").Key("NAME").SetValue(setting.Database.Name)
 	cfg.Section("database").Key("USER").SetValue(setting.Database.User)
 	cfg.Section("database").Key("PASSWD").SetValue(setting.Database.Passwd)
+	cfg.Section("database").Key("SCHEMA").SetValue(setting.Database.Schema)
 	cfg.Section("database").Key("SSL_MODE").SetValue(setting.Database.SSLMode)
 	cfg.Section("database").Key("CHARSET").SetValue(setting.Database.Charset)
 	cfg.Section("database").Key("PATH").SetValue(setting.Database.Path)
@@ -351,7 +355,7 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 		return
 	}
 
-	GlobalInit()
+	GlobalInit(graceful.GetManager().HammerContext())
 
 	// Create admin account
 	if len(form.AdminName) > 0 {
@@ -386,6 +390,12 @@ func InstallPost(ctx *context.Context, form auth.InstallForm) {
 	}
 
 	log.Info("First-time run install finished!")
+	// FIXME: This isn't really enough to completely take account of new configuration
+	// We should really be restarting:
+	// - On windows this is probably just a simple restart
+	// - On linux we can't just use graceful.RestartProcess() everything that was passed in on LISTEN_FDS
+	//   (active or not) needs to be passed out and everything new passed out too.
+	//   This means we need to prevent the cleanup goroutine from running prior to the second GlobalInit
 	ctx.Flash.Success(ctx.Tr("install.install_success"))
 	ctx.Redirect(form.AppURL + "user/login")
 }

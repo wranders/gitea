@@ -31,6 +31,7 @@ func Settings(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsOptions"] = true
 	ctx.Data["CurrentVisibility"] = ctx.Org.Organization.Visibility
+	ctx.Data["RepoAdminChangeTeamAccess"] = ctx.Org.Organization.RepoAdminChangeTeamAccess
 	ctx.HTML(200, tplSettingsOptions)
 }
 
@@ -83,6 +84,7 @@ func SettingsPost(ctx *context.Context, form auth.UpdateOrgSettingForm) {
 	org.Website = form.Website
 	org.Location = form.Location
 	org.Visibility = form.Visibility
+	org.RepoAdminChangeTeamAccess = form.RepoAdminChangeTeamAccess
 	if err := models.UpdateUser(org); err != nil {
 		ctx.ServerError("UpdateUser", err)
 		return
@@ -113,7 +115,7 @@ func SettingsDeleteAvatar(ctx *context.Context) {
 	ctx.Redirect(ctx.Org.OrgLink + "/settings")
 }
 
-// SettingsDelete response for delete repository
+// SettingsDelete response for deleting an organization
 func SettingsDelete(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("org.settings")
 	ctx.Data["PageIsSettingsDelete"] = true
@@ -153,7 +155,7 @@ func Webhooks(ctx *context.Context) {
 	ctx.Data["BaseLink"] = ctx.Org.OrgLink + "/settings/hooks"
 	ctx.Data["Description"] = ctx.Tr("org.settings.hooks_desc")
 
-	ws, err := models.GetWebhooksByOrgID(ctx.Org.Organization.ID)
+	ws, err := models.GetWebhooksByOrgID(ctx.Org.Organization.ID, models.ListOptions{})
 	if err != nil {
 		ctx.ServerError("GetWebhooksByOrgId", err)
 		return

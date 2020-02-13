@@ -19,6 +19,7 @@ import (
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/setting"
 	api "code.gitea.io/gitea/modules/structs"
+	"code.gitea.io/gitea/modules/webhook"
 
 	"github.com/unknwon/com"
 )
@@ -37,7 +38,7 @@ func Webhooks(ctx *context.Context) {
 	ctx.Data["BaseLink"] = ctx.Repo.RepoLink + "/settings/hooks"
 	ctx.Data["Description"] = ctx.Tr("repo.settings.hooks_desc", "https://docs.gitea.io/en-us/webhooks/")
 
-	ws, err := models.GetWebhooksByRepoID(ctx.Repo.Repository.ID)
+	ws, err := models.GetWebhooksByRepoID(ctx.Repo.Repository.ID, models.ListOptions{})
 	if err != nil {
 		ctx.ServerError("GetWebhooksByRepoID", err)
 		return
@@ -198,20 +199,17 @@ func WebHooksNewPost(ctx *context.Context, form auth.NewWebhookForm) {
 }
 
 // GogsHooksNewPost response for creating webhook
-func GogsHooksNewPost(ctx *context.Context, form auth.NewWebhookForm) {
-	newGenericWebhookPost(ctx, form, models.GOGS)
+func GogsHooksNewPost(ctx *context.Context, form auth.NewGogshookForm) {
+	newGogsWebhookPost(ctx, form, models.GOGS)
 }
 
-func newGenericWebhookPost(ctx *context.Context, form auth.NewWebhookForm, kind models.HookTaskType) {
+// newGogsWebhookPost response for creating gogs hook
+func newGogsWebhookPost(ctx *context.Context, form auth.NewGogshookForm, kind models.HookTaskType) {
 	ctx.Data["Title"] = ctx.Tr("repo.settings.add_webhook")
 	ctx.Data["PageIsSettingsHooks"] = true
 	ctx.Data["PageIsSettingsHooksNew"] = true
 	ctx.Data["Webhook"] = models.Webhook{HookEvent: &models.HookEvent{}}
-
-	ctx.Data["HookType"] = "gitea"
-	if kind == models.GOGS {
-		ctx.Data["HookType"] = "gogs"
-	}
+	ctx.Data["HookType"] = "gogs"
 
 	orCtx, err := getOrgRepoCtx(ctx)
 	if err != nil {
@@ -270,7 +268,7 @@ func DiscordHooksNewPost(ctx *context.Context, form auth.NewDiscordHookForm) {
 		return
 	}
 
-	meta, err := json.Marshal(&models.DiscordMeta{
+	meta, err := json.Marshal(&webhook.DiscordMeta{
 		Username: form.Username,
 		IconURL:  form.IconURL,
 	})
@@ -359,7 +357,7 @@ func TelegramHooksNewPost(ctx *context.Context, form auth.NewTelegramHookForm) {
 		return
 	}
 
-	meta, err := json.Marshal(&models.TelegramMeta{
+	meta, err := json.Marshal(&webhook.TelegramMeta{
 		BotToken: form.BotToken,
 		ChatID:   form.ChatID,
 	})
@@ -454,7 +452,7 @@ func SlackHooksNewPost(ctx *context.Context, form auth.NewSlackHookForm) {
 		return
 	}
 
-	meta, err := json.Marshal(&models.SlackMeta{
+	meta, err := json.Marshal(&webhook.SlackMeta{
 		Channel:  strings.TrimSpace(form.Channel),
 		Username: form.Username,
 		IconURL:  form.IconURL,
@@ -473,6 +471,46 @@ func SlackHooksNewPost(ctx *context.Context, form auth.NewSlackHookForm) {
 		IsActive:     form.Active,
 		HookTaskType: models.SLACK,
 		Meta:         string(meta),
+		OrgID:        orCtx.OrgID,
+	}
+	if err := w.UpdateEvent(); err != nil {
+		ctx.ServerError("UpdateEvent", err)
+		return
+	} else if err := models.CreateWebhook(w); err != nil {
+		ctx.ServerError("CreateWebhook", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("repo.settings.add_hook_success"))
+	ctx.Redirect(orCtx.Link)
+}
+
+// FeishuHooksNewPost response for creating feishu hook
+func FeishuHooksNewPost(ctx *context.Context, form auth.NewFeishuHookForm) {
+	ctx.Data["Title"] = ctx.Tr("repo.settings")
+	ctx.Data["PageIsSettingsHooks"] = true
+	ctx.Data["PageIsSettingsHooksNew"] = true
+	ctx.Data["Webhook"] = models.Webhook{HookEvent: &models.HookEvent{}}
+
+	orCtx, err := getOrgRepoCtx(ctx)
+	if err != nil {
+		ctx.ServerError("getOrgRepoCtx", err)
+		return
+	}
+
+	if ctx.HasError() {
+		ctx.HTML(200, orCtx.NewTemplate)
+		return
+	}
+
+	w := &models.Webhook{
+		RepoID:       orCtx.RepoID,
+		URL:          form.PayloadURL,
+		ContentType:  models.ContentTypeJSON,
+		HookEvent:    ParseHookEvent(form.WebhookForm),
+		IsActive:     form.Active,
+		HookTaskType: models.FEISHU,
+		Meta:         "",
 		OrgID:        orCtx.OrgID,
 	}
 	if err := w.UpdateEvent(); err != nil {
@@ -517,11 +555,11 @@ func checkWebhook(ctx *context.Context) (*orgRepoCtx, *models.Webhook) {
 	ctx.Data["HookType"] = w.HookTaskType.Name()
 	switch w.HookTaskType {
 	case models.SLACK:
-		ctx.Data["SlackHook"] = w.GetSlackHook()
+		ctx.Data["SlackHook"] = webhook.GetSlackHook(w)
 	case models.DISCORD:
-		ctx.Data["DiscordHook"] = w.GetDiscordHook()
+		ctx.Data["DiscordHook"] = webhook.GetDiscordHook(w)
 	case models.TELEGRAM:
-		ctx.Data["TelegramHook"] = w.GetTelegramHook()
+		ctx.Data["TelegramHook"] = webhook.GetTelegramHook(w)
 	}
 
 	ctx.Data["History"], err = w.History(1)
@@ -648,7 +686,7 @@ func SlackHooksEditPost(ctx *context.Context, form auth.NewSlackHookForm) {
 		return
 	}
 
-	meta, err := json.Marshal(&models.SlackMeta{
+	meta, err := json.Marshal(&webhook.SlackMeta{
 		Channel:  strings.TrimSpace(form.Channel),
 		Username: form.Username,
 		IconURL:  form.IconURL,
@@ -692,7 +730,7 @@ func DiscordHooksEditPost(ctx *context.Context, form auth.NewDiscordHookForm) {
 		return
 	}
 
-	meta, err := json.Marshal(&models.DiscordMeta{
+	meta, err := json.Marshal(&webhook.DiscordMeta{
 		Username: form.Username,
 		IconURL:  form.IconURL,
 	})
@@ -765,7 +803,7 @@ func TelegramHooksEditPost(ctx *context.Context, form auth.NewTelegramHookForm) 
 		ctx.HTML(200, orCtx.NewTemplate)
 		return
 	}
-	meta, err := json.Marshal(&models.TelegramMeta{
+	meta, err := json.Marshal(&webhook.TelegramMeta{
 		BotToken: form.BotToken,
 		ChatID:   form.ChatID,
 	})
@@ -791,6 +829,38 @@ func TelegramHooksEditPost(ctx *context.Context, form auth.NewTelegramHookForm) 
 
 // MSTeamsHooksEditPost response for editing MS Teams hook
 func MSTeamsHooksEditPost(ctx *context.Context, form auth.NewMSTeamsHookForm) {
+	ctx.Data["Title"] = ctx.Tr("repo.settings")
+	ctx.Data["PageIsSettingsHooks"] = true
+	ctx.Data["PageIsSettingsHooksEdit"] = true
+
+	orCtx, w := checkWebhook(ctx)
+	if ctx.Written() {
+		return
+	}
+	ctx.Data["Webhook"] = w
+
+	if ctx.HasError() {
+		ctx.HTML(200, orCtx.NewTemplate)
+		return
+	}
+
+	w.URL = form.PayloadURL
+	w.HookEvent = ParseHookEvent(form.WebhookForm)
+	w.IsActive = form.Active
+	if err := w.UpdateEvent(); err != nil {
+		ctx.ServerError("UpdateEvent", err)
+		return
+	} else if err := models.UpdateWebhook(w); err != nil {
+		ctx.ServerError("UpdateWebhook", err)
+		return
+	}
+
+	ctx.Flash.Success(ctx.Tr("repo.settings.update_hook_success"))
+	ctx.Redirect(fmt.Sprintf("%s/%d", orCtx.Link, w.ID))
+}
+
+// FeishuHooksEditPost response for editing feishu hook
+func FeishuHooksEditPost(ctx *context.Context, form auth.NewFeishuHookForm) {
 	ctx.Data["Title"] = ctx.Tr("repo.settings")
 	ctx.Data["PageIsSettingsHooks"] = true
 	ctx.Data["PageIsSettingsHooksEdit"] = true
@@ -867,11 +937,10 @@ func TestWebhook(ctx *context.Context) {
 		Pusher: apiUser,
 		Sender: apiUser,
 	}
-	if err := models.PrepareWebhook(w, ctx.Repo.Repository, models.HookEventPush, p); err != nil {
+	if err := webhook.PrepareWebhook(w, ctx.Repo.Repository, models.HookEventPush, p); err != nil {
 		ctx.Flash.Error("PrepareWebhook: " + err.Error())
 		ctx.Status(500)
 	} else {
-		go models.HookQueue.Add(ctx.Repo.Repository.ID)
 		ctx.Flash.Info(ctx.Tr("repo.settings.webhook.test_delivery_success"))
 		ctx.Status(200)
 	}

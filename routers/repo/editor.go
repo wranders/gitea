@@ -19,6 +19,7 @@ import (
 	"code.gitea.io/gitea/modules/git"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/repofiles"
+	repo_module "code.gitea.io/gitea/modules/repository"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/upload"
 	"code.gitea.io/gitea/modules/util"
@@ -35,12 +36,13 @@ const (
 )
 
 func renderCommitRights(ctx *context.Context) bool {
-	canCommit, err := ctx.Repo.CanCommitToBranch(ctx.User)
+	canCommitToBranch, err := ctx.Repo.CanCommitToBranch(ctx.User)
 	if err != nil {
 		log.Error("CanCommitToBranch: %v", err)
 	}
-	ctx.Data["CanCommitToBranch"] = canCommit
-	return canCommit
+	ctx.Data["CanCommitToBranch"] = canCommitToBranch
+
+	return canCommitToBranch.CanCommitToBranch
 }
 
 // getParentTreeFields returns list of parent tree names and corresponding tree paths
@@ -269,7 +271,7 @@ func editFilePost(ctx *context.Context, form auth.EditRepoFileForm, isNewFile bo
 		}
 	}
 
-	if form.CommitChoice == frmCommitChoiceNewBranch {
+	if form.CommitChoice == frmCommitChoiceNewBranch && ctx.Repo.Repository.UnitEnabled(models.UnitTypePullRequests) {
 		ctx.Redirect(ctx.Repo.RepoLink + "/compare/" + ctx.Repo.BranchName + "..." + form.NewBranchName)
 	} else {
 		ctx.Redirect(ctx.Repo.RepoLink + "/src/branch/" + util.PathEscapeSegments(branchName) + "/" + util.PathEscapeSegments(form.TreePath))
@@ -434,7 +436,7 @@ func DeleteFilePost(ctx *context.Context, form auth.DeleteRepoFileForm) {
 	}
 
 	ctx.Flash.Success(ctx.Tr("repo.editor.file_delete_success", ctx.Repo.TreePath))
-	if form.CommitChoice == frmCommitChoiceNewBranch {
+	if form.CommitChoice == frmCommitChoiceNewBranch && ctx.Repo.Repository.UnitEnabled(models.UnitTypePullRequests) {
 		ctx.Redirect(ctx.Repo.RepoLink + "/compare/" + ctx.Repo.BranchName + "..." + form.NewBranchName)
 	} else {
 		treePath := filepath.Dir(ctx.Repo.TreePath)
@@ -458,6 +460,8 @@ func DeleteFilePost(ctx *context.Context, form auth.DeleteRepoFileForm) {
 
 func renderUploadSettings(ctx *context.Context) {
 	ctx.Data["RequireDropzone"] = true
+	ctx.Data["RequireTribute"] = true
+	ctx.Data["RequireSimpleMDE"] = true
 	ctx.Data["UploadAllowedTypes"] = strings.Join(setting.Repository.Upload.AllowedTypes, ",")
 	ctx.Data["UploadMaxSize"] = setting.Repository.Upload.FileMaxSize
 	ctx.Data["UploadMaxFiles"] = setting.Repository.Upload.MaxFiles
@@ -532,7 +536,7 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 	}
 
 	if oldBranchName != branchName {
-		if _, err := ctx.Repo.Repository.GetBranch(branchName); err == nil {
+		if _, err := repo_module.GetBranch(ctx.Repo.Repository, branchName); err == nil {
 			ctx.Data["Err_NewBranchName"] = true
 			ctx.RenderWithErr(ctx.Tr("repo.editor.branch_already_exists", branchName), tplUploadFile, &form)
 			return
@@ -585,11 +589,15 @@ func UploadFilePost(ctx *context.Context, form auth.UploadRepoFileForm) {
 		Files:        form.Files,
 	}); err != nil {
 		ctx.Data["Err_TreePath"] = true
-		ctx.RenderWithErr(ctx.Tr("repo.editor.unable_to_upload_files", form.TreePath, err), tplUploadFile, &form)
+		if models.IsErrLFSFileLocked(err) {
+			ctx.RenderWithErr(ctx.Tr("repo.editor.upload_file_is_locked", err.(models.ErrLFSFileLocked).Path, err.(models.ErrLFSFileLocked).UserName), tplUploadFile, &form)
+		} else {
+			ctx.RenderWithErr(ctx.Tr("repo.editor.unable_to_upload_files", form.TreePath, err), tplUploadFile, &form)
+		}
 		return
 	}
 
-	if form.CommitChoice == frmCommitChoiceNewBranch {
+	if form.CommitChoice == frmCommitChoiceNewBranch && ctx.Repo.Repository.UnitEnabled(models.UnitTypePullRequests) {
 		ctx.Redirect(ctx.Repo.RepoLink + "/compare/" + ctx.Repo.BranchName + "..." + form.NewBranchName)
 	} else {
 		ctx.Redirect(ctx.Repo.RepoLink + "/src/branch/" + util.PathEscapeSegments(branchName) + "/" + util.PathEscapeSegments(form.TreePath))
@@ -673,7 +681,7 @@ func GetUniquePatchBranchName(ctx *context.Context) string {
 	prefix := ctx.User.LowerName + "-patch-"
 	for i := 1; i <= 1000; i++ {
 		branchName := fmt.Sprintf("%s%d", prefix, i)
-		if _, err := ctx.Repo.Repository.GetBranch(branchName); err != nil {
+		if _, err := repo_module.GetBranch(ctx.Repo.Repository, branchName); err != nil {
 			if git.IsErrBranchNotExist(err) {
 				return branchName
 			}

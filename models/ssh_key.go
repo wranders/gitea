@@ -28,15 +28,15 @@ import (
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/timeutil"
 
-	"github.com/go-xorm/xorm"
 	"github.com/unknwon/com"
 	"golang.org/x/crypto/ssh"
 	"xorm.io/builder"
+	"xorm.io/xorm"
 )
 
 const (
 	tplCommentPrefix = `# gitea public key`
-	tplPublicKey     = tplCommentPrefix + "\n" + `command="%s serv key-%d --config='%s'",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s` + "\n"
+	tplPublicKey     = tplCommentPrefix + "\n" + `command="%s --config='%s' serv key-%d",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty %s` + "\n"
 )
 
 var sshOpLocker sync.Mutex
@@ -81,7 +81,7 @@ func (key *PublicKey) OmitEmail() string {
 
 // AuthorizedString returns formatted public key string for authorized_keys file.
 func (key *PublicKey) AuthorizedString() string {
-	return fmt.Sprintf(tplPublicKey, setting.AppPath, key.ID, setting.CustomConf, key.Content)
+	return fmt.Sprintf(tplPublicKey, setting.AppPath, setting.CustomConf, key.ID, key.Content)
 }
 
 func extractTypeFromBase64Key(key string) (string, error) {
@@ -107,7 +107,7 @@ func parseKeyString(content string) (string, error) {
 
 	var keyType, keyContent, keyComment string
 
-	if content[:len(ssh2keyStart)] == ssh2keyStart {
+	if strings.HasPrefix(content, ssh2keyStart) {
 		// Parse SSH2 file format.
 
 		// Transform all legal line endings to a single "\n".
@@ -358,6 +358,18 @@ func appendAuthorizedKeysToFile(keys ...*PublicKey) error {
 	sshOpLocker.Lock()
 	defer sshOpLocker.Unlock()
 
+	if setting.SSH.RootPath != "" {
+		// First of ensure that the RootPath is present, and if not make it with 0700 permissions
+		// This of course doesn't guarantee that this is the right directory for authorized_keys
+		// but at least if it's supposed to be this directory and it doesn't exist and we're the
+		// right user it will at least be created properly.
+		err := os.MkdirAll(setting.SSH.RootPath, 0700)
+		if err != nil {
+			log.Error("Unable to MkdirAll(%s): %v", setting.SSH.RootPath, err)
+			return err
+		}
+	}
+
 	fPath := filepath.Join(setting.SSH.RootPath, "authorized_keys")
 	f, err := os.OpenFile(fPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
 	if err != nil {
@@ -555,11 +567,17 @@ func SearchPublicKey(uid int64, fingerprint string) ([]*PublicKey, error) {
 }
 
 // ListPublicKeys returns a list of public keys belongs to given user.
-func ListPublicKeys(uid int64) ([]*PublicKey, error) {
+func ListPublicKeys(uid int64, listOptions ListOptions) ([]*PublicKey, error) {
+	sess := x.Where("owner_id = ?", uid)
+	if listOptions.Page != 0 {
+		sess = listOptions.setSessionPagination(sess)
+
+		keys := make([]*PublicKey, 0, listOptions.PageSize)
+		return keys, sess.Find(&keys)
+	}
+
 	keys := make([]*PublicKey, 0, 5)
-	return keys, x.
-		Where("owner_id = ?", uid).
-		Find(&keys)
+	return keys, sess.Find(&keys)
 }
 
 // ListPublicLdapSSHKeys returns a list of synchronized public ldap ssh keys belongs to given user and login source.
@@ -644,6 +662,18 @@ func rewriteAllPublicKeys(e Engine) error {
 
 	sshOpLocker.Lock()
 	defer sshOpLocker.Unlock()
+
+	if setting.SSH.RootPath != "" {
+		// First of ensure that the RootPath is present, and if not make it with 0700 permissions
+		// This of course doesn't guarantee that this is the right directory for authorized_keys
+		// but at least if it's supposed to be this directory and it doesn't exist and we're the
+		// right user it will at least be created properly.
+		err := os.MkdirAll(setting.SSH.RootPath, 0700)
+		if err != nil {
+			log.Error("Unable to MkdirAll(%s): %v", setting.SSH.RootPath, err)
+			return err
+		}
+	}
 
 	fPath := filepath.Join(setting.SSH.RootPath, "authorized_keys")
 	tmpPath := fPath + ".tmp"
@@ -946,15 +976,21 @@ func deleteDeployKey(sess Engine, doer *User, id int64) error {
 }
 
 // ListDeployKeys returns all deploy keys by given repository ID.
-func ListDeployKeys(repoID int64) ([]*DeployKey, error) {
-	return listDeployKeys(x, repoID)
+func ListDeployKeys(repoID int64, listOptions ListOptions) ([]*DeployKey, error) {
+	return listDeployKeys(x, repoID, listOptions)
 }
 
-func listDeployKeys(e Engine, repoID int64) ([]*DeployKey, error) {
+func listDeployKeys(e Engine, repoID int64, listOptions ListOptions) ([]*DeployKey, error) {
+	sess := e.Where("repo_id = ?", repoID)
+	if listOptions.Page != 0 {
+		sess = listOptions.setSessionPagination(sess)
+
+		keys := make([]*DeployKey, 0, listOptions.PageSize)
+		return keys, sess.Find(&keys)
+	}
+
 	keys := make([]*DeployKey, 0, 5)
-	return keys, e.
-		Where("repo_id = ?", repoID).
-		Find(&keys)
+	return keys, sess.Find(&keys)
 }
 
 // SearchDeployKeys returns a list of deploy keys matching the provided arguments.

@@ -10,6 +10,8 @@ PASSWD   = {{TEST_MYSQL_PASSWORD}}
 SSL_MODE = disable
 
 [indexer]
+ISSUE_INDEXER_TYPE = elasticsearch
+ISSUE_INDEXER_CONN_STR = http://elastic:changeme@elasticsearch:9200
 ISSUE_INDEXER_PATH = integrations/indexers-mysql/issues.bleve
 REPO_INDEXER_ENABLED = true
 REPO_INDEXER_PATH = integrations/indexers-mysql/repos.bleve
@@ -20,6 +22,9 @@ ROOT = integrations/gitea-integration-mysql/gitea-repositories
 [repository.local]
 LOCAL_COPY_PATH = tmp/local-repo-mysql
 LOCAL_WIKI_PATH = tmp/local-wiki-mysql
+
+[repository.signing]
+SIGNING_KEY = none
 
 [server]
 SSH_DOMAIN       = localhost
@@ -62,7 +67,7 @@ PROVIDER_CONFIG = data/sessions-mysql
 
 [log]
 MODE                 = test,file
-ROOT_PATH            = sqlite-log
+ROOT_PATH            = mysql-log
 REDIRECT_MACARON_LOG = true
 ROUTER               = ,
 MACARON              = ,

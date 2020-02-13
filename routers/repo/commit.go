@@ -14,6 +14,7 @@ import (
 	"code.gitea.io/gitea/modules/charset"
 	"code.gitea.io/gitea/modules/context"
 	"code.gitea.io/gitea/modules/git"
+	"code.gitea.io/gitea/modules/gitgraph"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/services/gitdiff"
@@ -57,8 +58,13 @@ func Commits(ctx *context.Context) {
 		page = 1
 	}
 
+	pageSize := ctx.QueryInt("limit")
+	if pageSize <= 0 {
+		pageSize = git.CommitsRangeSize
+	}
+
 	// Both `git log branchName` and `git log commitId` work.
-	commits, err := ctx.Repo.Commit.CommitsByRange(page)
+	commits, err := ctx.Repo.Commit.CommitsByRange(page, pageSize)
 	if err != nil {
 		ctx.ServerError("CommitsByRange", err)
 		return
@@ -91,7 +97,15 @@ func Graph(ctx *context.Context) {
 		return
 	}
 
-	graph, err := models.GetCommitGraph(ctx.Repo.GitRepo)
+	allCommitsCount, err := ctx.Repo.GitRepo.GetAllCommitsCount()
+	if err != nil {
+		ctx.ServerError("GetAllCommitsCount", err)
+		return
+	}
+
+	page := ctx.QueryInt("page")
+
+	graph, err := gitgraph.GetCommitGraph(ctx.Repo.GitRepo, page)
 	if err != nil {
 		ctx.ServerError("GetCommitGraph", err)
 		return
@@ -102,9 +116,8 @@ func Graph(ctx *context.Context) {
 	ctx.Data["Reponame"] = ctx.Repo.Repository.Name
 	ctx.Data["CommitCount"] = commitsCount
 	ctx.Data["Branch"] = ctx.Repo.BranchName
-	ctx.Data["RequireGitGraph"] = true
+	ctx.Data["Page"] = context.NewPagination(int(allCommitsCount), setting.UI.GraphMaxCommitNum, page, 5)
 	ctx.HTML(200, tplGraph)
-
 }
 
 // SearchCommits render commits filtered by keyword
@@ -193,6 +206,8 @@ func FileHistory(ctx *context.Context) {
 func Diff(ctx *context.Context) {
 	ctx.Data["PageIsDiff"] = true
 	ctx.Data["RequireHighlightJS"] = true
+	ctx.Data["RequireSimpleMDE"] = true
+	ctx.Data["RequireTribute"] = true
 
 	userName := ctx.Repo.Owner.Name
 	repoName := ctx.Repo.Repository.Name
@@ -237,9 +252,21 @@ func Diff(ctx *context.Context) {
 	}
 
 	ctx.Data["CommitID"] = commitID
+	ctx.Data["AfterCommitID"] = commitID
 	ctx.Data["Username"] = userName
 	ctx.Data["Reponame"] = repoName
-	ctx.Data["IsImageFile"] = commit.IsImageFile
+
+	var parentCommit *git.Commit
+	if commit.ParentCount() > 0 {
+		parentCommit, err = ctx.Repo.GitRepo.GetCommit(parents[0])
+		if err != nil {
+			ctx.NotFound("GetParentCommit", err)
+			return
+		}
+	}
+	setImageCompareContext(ctx, parentCommit, commit)
+	headTarget := path.Join(userName, repoName)
+	setPathsCompareContext(ctx, parentCommit, commit, headTarget)
 	ctx.Data["Title"] = commit.Summary() + " · " + base.ShortSha(commitID)
 	ctx.Data["Commit"] = commit
 	ctx.Data["Verification"] = models.ParseCommitWithSignature(commit)
@@ -247,7 +274,6 @@ func Diff(ctx *context.Context) {
 	ctx.Data["Diff"] = diff
 	ctx.Data["Parents"] = parents
 	ctx.Data["DiffNotAvailable"] = diff.NumFiles() == 0
-	ctx.Data["SourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", commitID)
 
 	note := &git.Note{}
 	err = git.GetNote(ctx.Repo.GitRepo, commitID, note)
@@ -257,10 +283,6 @@ func Diff(ctx *context.Context) {
 		ctx.Data["NoteAuthor"] = models.ValidateCommitWithEmail(note.Commit)
 	}
 
-	if commit.ParentCount() > 0 {
-		ctx.Data["BeforeSourcePath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "src", "commit", parents[0])
-	}
-	ctx.Data["RawPath"] = setting.AppSubURL + "/" + path.Join(userName, repoName, "raw", "commit", commitID)
 	ctx.Data["BranchName"], err = commit.GetBranchName()
 	if err != nil {
 		ctx.ServerError("commit.GetBranchName", err)
@@ -270,10 +292,10 @@ func Diff(ctx *context.Context) {
 
 // RawDiff dumps diff results of repository in given commit ID to io.Writer
 func RawDiff(ctx *context.Context) {
-	if err := gitdiff.GetRawDiff(
+	if err := git.GetRawDiff(
 		models.RepoPath(ctx.Repo.Owner.Name, ctx.Repo.Repository.Name),
 		ctx.Params(":sha"),
-		gitdiff.RawDiffType(ctx.Params(":ext")),
+		git.RawDiffType(ctx.Params(":ext")),
 		ctx.Resp,
 	); err != nil {
 		ctx.ServerError("GetRawDiff", err)

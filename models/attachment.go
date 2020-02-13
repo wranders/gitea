@@ -14,8 +14,8 @@ import (
 	api "code.gitea.io/gitea/modules/structs"
 	"code.gitea.io/gitea/modules/timeutil"
 
-	"github.com/go-xorm/xorm"
 	gouuid "github.com/satori/go.uuid"
+	"xorm.io/xorm"
 )
 
 // Attachment represent a attachment of issue/comment/release.
@@ -69,6 +69,26 @@ func (a *Attachment) LocalPath() string {
 // DownloadURL returns the download url of the attached file
 func (a *Attachment) DownloadURL() string {
 	return fmt.Sprintf("%sattachments/%s", setting.AppURL, a.UUID)
+}
+
+// LinkedRepository returns the linked repo if any
+func (a *Attachment) LinkedRepository() (*Repository, UnitType, error) {
+	if a.IssueID != 0 {
+		iss, err := GetIssueByID(a.IssueID)
+		if err != nil {
+			return nil, UnitTypeIssues, err
+		}
+		repo, err := GetRepositoryByID(iss.RepoID)
+		return repo, UnitTypeIssues, err
+	} else if a.ReleaseID != 0 {
+		rel, err := GetReleaseByID(a.ReleaseID)
+		if err != nil {
+			return nil, UnitTypeReleases, err
+		}
+		repo, err := GetRepositoryByID(rel.RepoID)
+		return repo, UnitTypeReleases, err
+	}
+	return nil, -1, nil
 }
 
 // NewAttachment creates a new attachment object.
@@ -131,6 +151,11 @@ func getAttachmentByUUID(e Engine, uuid string) (*Attachment, error) {
 		return nil, ErrAttachmentNotExist{0, uuid}
 	}
 	return attach, nil
+}
+
+// GetAttachmentsByUUIDs returns attachment by given UUID list.
+func GetAttachmentsByUUIDs(uuids []string) ([]*Attachment, error) {
+	return getAttachmentsByUUIDs(x, uuids)
 }
 
 func getAttachmentsByUUIDs(e Engine, uuids []string) ([]*Attachment, error) {
@@ -253,5 +278,11 @@ func updateAttachment(e Engine, atta *Attachment) error {
 		sess = e.Where("uuid = ?", atta.UUID)
 	}
 	_, err := sess.Cols("name", "issue_id", "release_id", "comment_id", "download_count").Update(atta)
+	return err
+}
+
+// DeleteAttachmentsByRelease deletes all attachments associated with the given release.
+func DeleteAttachmentsByRelease(releaseID int64) error {
+	_, err := x.Where("release_id = ?", releaseID).Delete(&Attachment{})
 	return err
 }

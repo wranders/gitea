@@ -6,9 +6,14 @@
 package migrations
 
 import (
+	"context"
+	"fmt"
+
 	"code.gitea.io/gitea/models"
 	"code.gitea.io/gitea/modules/log"
 	"code.gitea.io/gitea/modules/migrations/base"
+	"code.gitea.io/gitea/modules/setting"
+	"code.gitea.io/gitea/modules/structs"
 )
 
 // MigrateOptions is equal to base.MigrateOptions
@@ -24,10 +29,11 @@ func RegisterDownloaderFactory(factory base.DownloaderFactory) {
 }
 
 // MigrateRepository migrate repository according MigrateOptions
-func MigrateRepository(doer *models.User, ownerName string, opts base.MigrateOptions) (*models.Repository, error) {
+func MigrateRepository(ctx context.Context, doer *models.User, ownerName string, opts base.MigrateOptions) (*models.Repository, error) {
 	var (
 		downloader base.Downloader
-		uploader   = NewGiteaLocalUploader(doer, ownerName, opts.Name)
+		uploader   = NewGiteaLocalUploader(ctx, doer, ownerName, opts.RepoName)
+		theFactory base.DownloaderFactory
 	)
 
 	for _, factory := range factories {
@@ -38,6 +44,7 @@ func MigrateRepository(doer *models.User, ownerName string, opts base.MigrateOpt
 			if err != nil {
 				return nil, err
 			}
+			theFactory = factory
 			break
 		}
 	}
@@ -50,13 +57,28 @@ func MigrateRepository(doer *models.User, ownerName string, opts base.MigrateOpt
 		opts.Comments = false
 		opts.Issues = false
 		opts.PullRequests = false
-		downloader = NewPlainGitDownloader(ownerName, opts.Name, opts.RemoteURL)
-		log.Trace("Will migrate from git: %s", opts.RemoteURL)
+		opts.GitServiceType = structs.PlainGitService
+		downloader = NewPlainGitDownloader(ownerName, opts.RepoName, opts.CloneAddr)
+		log.Trace("Will migrate from git: %s", opts.OriginalURL)
+	} else if opts.GitServiceType == structs.NotMigrated {
+		opts.GitServiceType = theFactory.GitServiceType()
 	}
+
+	uploader.gitServiceType = opts.GitServiceType
+
+	if setting.Migrations.MaxAttempts > 1 {
+		downloader = base.NewRetryDownloader(downloader, setting.Migrations.MaxAttempts, setting.Migrations.RetryBackoff)
+	}
+
+	downloader.SetContext(ctx)
 
 	if err := migrateRepository(downloader, uploader, opts); err != nil {
 		if err1 := uploader.Rollback(); err1 != nil {
 			log.Error("rollback failed: %v", err1)
+		}
+
+		if err2 := models.CreateRepositoryNotice(fmt.Sprintf("Migrate repository from %s failed: %v", opts.OriginalURL, err)); err2 != nil {
+			log.Error("create respotiry notice failed: ", err2)
 		}
 		return nil, err
 	}
@@ -81,6 +103,7 @@ func migrateRepository(downloader base.Downloader, uploader base.Uploader, opts 
 	if err := uploader.CreateRepo(repo, opts); err != nil {
 		return err
 	}
+	defer uploader.Close()
 
 	log.Trace("migrating topics")
 	topics, err := downloader.GetTopics()
@@ -151,9 +174,17 @@ func migrateRepository(downloader base.Downloader, uploader base.Uploader, opts 
 			}
 			releases = releases[relBatchSize:]
 		}
+
+		// Once all releases (if any) are inserted, sync any remaining non-release tags
+		if err := uploader.SyncTags(); err != nil {
+			return err
+		}
 	}
 
-	var commentBatchSize = uploader.MaxBatchInsertSize("comment")
+	var (
+		commentBatchSize = uploader.MaxBatchInsertSize("comment")
+		reviewBatchSize  = uploader.MaxBatchInsertSize("review")
+	)
 
 	if opts.Issues {
 		log.Trace("migrating issues and comments")
@@ -220,6 +251,7 @@ func migrateRepository(downloader base.Downloader, uploader base.Uploader, opts 
 				continue
 			}
 
+			// plain comments
 			var allComments = make([]*base.Comment, 0, commentBatchSize)
 			for _, pr := range prs {
 				comments, err := downloader.GetComments(pr.Number)
@@ -238,6 +270,29 @@ func migrateRepository(downloader base.Downloader, uploader base.Uploader, opts 
 			}
 			if len(allComments) > 0 {
 				if err := uploader.CreateComments(allComments...); err != nil {
+					return err
+				}
+			}
+
+			// migrate reviews
+			var allReviews = make([]*base.Review, 0, reviewBatchSize)
+			for _, pr := range prs {
+				reviews, err := downloader.GetReviews(pr.Number)
+				if err != nil {
+					return err
+				}
+
+				allReviews = append(allReviews, reviews...)
+
+				if len(allReviews) >= reviewBatchSize {
+					if err := uploader.CreateReviews(allReviews[:reviewBatchSize]...); err != nil {
+						return err
+					}
+					allReviews = allReviews[reviewBatchSize:]
+				}
+			}
+			if len(allReviews) > 0 {
+				if err := uploader.CreateReviews(allReviews...); err != nil {
 					return err
 				}
 			}
